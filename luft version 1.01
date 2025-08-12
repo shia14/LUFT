@@ -1,0 +1,415 @@
+import os
+import socket
+import threading
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+import sqlite3
+import json
+import time
+import traceback
+
+# — Configuration & State —
+
+CONFIG_PATH = "luft_config.json"
+DB_PATH = "luft_history.db"
+
+def load_config():
+    default = {"device_name": "LuftDevice", "recv_folder": os.getcwd()}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            data = json.load(open(CONFIG_PATH))
+            return {**default, **data}
+        except Exception:
+            pass
+    json.dump(default, open(CONFIG_PATH, "w"))
+    return default
+
+def save_config(cfg):
+    json.dump(cfg, open(CONFIG_PATH, "w"))
+
+cfg = load_config()
+os.makedirs(cfg["recv_folder"], exist_ok=True)
+
+# — History DB Setup —
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''
+      CREATE TABLE IF NOT EXISTS history(
+          id INTEGER PRIMARY KEY,
+          timestamp DATETIME,
+          filename TEXT, direction TEXT,
+          peer TEXT, status TEXT
+      )
+    ''')
+    conn.close()
+
+def log_history(filename, direction, peer, status):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''
+      INSERT INTO history(timestamp,filename,direction,peer,status)
+      VALUES (?,?,?,?,?)
+    ''', (time.strftime("%Y-%m-%d %H:%M:%S"), filename, direction, peer, status))
+    conn.commit()
+    conn.close()
+
+# — Device Discovery via UDP —
+
+UDP_PORT = 52000
+BROADCAST_INTERVAL = 2
+EXPIRY = 6
+
+class DeviceScanner(threading.Thread):
+    def __init__(self, on_update):
+        super().__init__(daemon=True)
+        self.on_update = on_update
+        self.devices = {}
+
+    def run(self):
+        threading.Thread(target=self._broadcast, daemon=True).start()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", UDP_PORT))
+        except Exception:
+            print("[DeviceScanner] bind failed:")
+            print(traceback.format_exc())
+            return
+        sock.settimeout(1)
+        while True:
+            now = time.time()
+            try:
+                data, addr = sock.recvfrom(256)
+                msg = data.decode(errors="ignore")
+                if msg.startswith("LUFT::"):
+                    name = msg.split("::",1)[1]
+                    self.devices[addr[0]] = (name, now)
+            except socket.timeout:
+                pass
+            except Exception:
+                print("[DeviceScanner] recv error:")
+                print(traceback.format_exc())
+            # purge expired
+            self.devices = {ip: (n,t) for ip,(n,t) in self.devices.items() if now-t < EXPIRY}
+            try:
+                self.on_update(self.devices)
+            except Exception:
+                print("[DeviceScanner] on_update error:")
+                print(traceback.format_exc())
+
+    def _broadcast(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while True:
+            try:
+                msg = f"LUFT::{cfg['device_name']}"
+                sock.sendto(msg.encode(), ("<broadcast>", UDP_PORT))
+            except Exception:
+                print("[DeviceScanner] broadcast error:")
+                print(traceback.format_exc())
+            time.sleep(BROADCAST_INTERVAL)
+
+# — TCP Receiver —
+
+TCP_PORT = 53000
+BUFFER = 4096
+
+def start_receiver():
+    def handle(c):
+        fn = "[?]"
+        peer = "[?]"
+        try:
+            peer = c.getpeername()[0]
+            fn = c.recv(256).decode()
+            base, ext = os.path.splitext(fn)
+            dest = os.path.join(cfg["recv_folder"], fn)
+            i = 1
+            while os.path.exists(dest):
+                dest = os.path.join(cfg["recv_folder"], f"{base}_{i}{ext}")
+                i += 1
+            with open(dest,"wb") as f:
+                while True:
+                    chunk = c.recv(BUFFER)
+                    if not chunk: break
+                    f.write(chunk)
+            log_history(fn, "received", peer, "success")
+        except Exception:
+            print("[Receiver] error handling incoming file:")
+            print(traceback.format_exc())
+            log_history(fn if fn else "[?]", "received", peer, "fail")
+        finally:
+            try:
+                c.close()
+            except:
+                pass
+
+    def server():
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("", TCP_PORT)); s.listen(5)
+        except Exception:
+            print("[Receiver] bind/listen failed:")
+            print(traceback.format_exc())
+            return
+        while True:
+            try:
+                conn,_ = s.accept()
+                threading.Thread(target=handle, args=(conn,), daemon=True).start()
+            except Exception:
+                print("[Receiver] accept error:")
+                print(traceback.format_exc())
+
+    threading.Thread(target=server, daemon=True).start()
+
+# — Sender w/ Pause/Resume —
+
+class FileSender(threading.Thread):
+    def __init__(self, ip, filepath, on_progress, on_complete):
+        super().__init__(daemon=True)
+        self.ip, self.filepath = ip, filepath
+        self.on_progress, self.on_complete = on_progress, on_complete
+        self.pause = threading.Event()
+        self.stop = False
+
+    def run(self):
+        fn = os.path.basename(self.filepath)
+        try:
+            size = os.path.getsize(self.filepath)
+            sent = 0
+            s = socket.socket()
+            s.settimeout(10)
+            s.connect((self.ip, TCP_PORT))
+            s.send(fn.encode())
+            with open(self.filepath,"rb") as f:
+                while not self.stop:
+                    if self.pause.is_set():
+                        time.sleep(0.2)
+                        continue
+                    data = f.read(BUFFER)
+                    if not data: break
+                    s.sendall(data)
+                    sent += len(data)
+                    try:
+                        self.on_progress(sent, size)
+                    except Exception:
+                        print("[FileSender] on_progress callback error:")
+                        print(traceback.format_exc())
+            try:
+                s.close()
+            except:
+                pass
+            log_history(fn, "sent", self.ip, "success" if not self.stop else "stopped")
+            try:
+                self.on_complete(not self.stop)
+            except Exception:
+                print("[FileSender] on_complete callback error:")
+                print(traceback.format_exc())
+        except Exception:
+            print("[FileSender] send failed:")
+            print(traceback.format_exc())
+            log_history(fn, "sent", self.ip, "fail")
+            try:
+                self.on_complete(False)
+            except Exception:
+                pass
+
+# — Main GUI —
+
+class LuftGUI:
+    def __init__(self, root):
+        self.root = root
+        root.title("Luft")
+        root.geometry("500x550")
+
+        self.devices = {}
+        self.sender = None
+
+        # Initialize all frames here
+        self.frame_devices = tk.Frame(root)
+        self.frame_send = tk.Frame(root)
+        self.frame_history = tk.Frame(root)
+        self.frame_settings = tk.Frame(root)
+
+        self.init_device_frame()
+        self.init_send_frame()
+        self.init_history_frame()
+        self.init_settings_frame()
+
+        DeviceScanner(self.update_devices).start()
+        start_receiver()
+
+        self.show_frame(self.frame_devices)
+
+    def show_frame(self, frame):
+        # Hide all frames
+        for f in [self.frame_devices, self.frame_send, self.frame_history, self.frame_settings]:
+            f.pack_forget()
+        frame.pack(fill="both", expand=True)
+
+    # Devices frame
+    def init_device_frame(self):
+        tk.Label(self.frame_devices, text="Nearby Devices", font=("Arial",14)).pack(pady=5)
+        self.lb = tk.Listbox(self.frame_devices)
+        self.lb.pack(padx=20,pady=10, fill="both", expand=True)
+        self.lb.bind("<<ListboxSelect>>", self.on_select)
+        tk.Button(self.frame_devices, text="History", command=lambda: [self.update_history(), self.show_frame(self.frame_history)]).pack(side="left", padx=20,pady=5)
+        tk.Button(self.frame_devices, text="Settings", command=lambda: self.show_frame(self.frame_settings)).pack(side="right", padx=20,pady=5)
+        # mapping of listbox index -> (ip,name)
+        self.lb_map = {}
+
+    # Send frame
+    def init_send_frame(self):
+        tk.Label(self.frame_send, text="Target:", font=("Arial",12)).pack(pady=3)
+        self.lbl_target = tk.Label(self.frame_send, text="", font=("Arial",12,"bold"))
+        self.lbl_target.pack()
+        tk.Button(self.frame_send, text="Choose File", command=self.choose_file).pack(pady=5)
+        self.lbl_file = tk.Label(self.frame_send, text="No file selected")
+        self.lbl_file.pack()
+        self.progress = ttk.Progressbar(self.frame_send, length=300, mode="determinate")
+        self.progress.pack(pady=10)
+        fcb = tk.Frame(self.frame_send)
+        self.btn_send = tk.Button(fcb, text="Send", command=self.start_send, state="disabled")
+        self.btn_send.grid(row=0,column=0,padx=5)
+        self.btn_pause = tk.Button(fcb, text="Pause", command=self.pause_send, state="disabled")
+        self.btn_pause.grid(row=0,column=1,padx=5)
+        self.btn_resume = tk.Button(fcb, text="Resume", command=self.resume_send, state="disabled")
+        self.btn_resume.grid(row=0,column=2,padx=5)
+        self.btn_cancel = tk.Button(fcb, text="Cancel", command=self.cancel_send, state="disabled")
+        self.btn_cancel.grid(row=0,column=3,padx=5)
+        fcb.pack(pady=5)
+        tk.Button(self.frame_send, text="← Back", command=lambda: self.show_frame(self.frame_devices)).pack(pady=10)
+
+    # History frame
+    def init_history_frame(self):
+        tk.Label(self.frame_history, text="Transfer History", font=("Arial",14)).pack(pady=5)
+        self.tv = ttk.Treeview(self.frame_history, columns=("timestamp","filename","direction","peer","status"), show="headings")
+        cols=[("timestamp","Time"),("filename","File"),("direction","Dir"),("peer","Peer"),("status","Status")]
+        for c,t in cols:
+            self.tv.heading(c, text=t)
+        # adjust widths so filenames can show
+        self.tv.column("timestamp", width=140)
+        self.tv.column("filename", width=200)
+        self.tv.column("direction", width=60)
+        self.tv.column("peer", width=120)
+        self.tv.column("status", width=80)
+        self.tv.pack(fill="both",expand=True, padx=10, pady=10)
+        tk.Button(self.frame_history, text="← Back", command=lambda: self.show_frame(self.frame_devices)).pack(pady=10)
+
+    def update_history(self):
+        self.tv.delete(*self.tv.get_children())
+        conn = sqlite3.connect(DB_PATH)
+        for row in conn.execute("SELECT timestamp,filename,direction,peer,status FROM history ORDER BY id DESC"):
+            self.tv.insert("","end",values=row)
+        conn.close()
+
+    # Settings frame
+    def init_settings_frame(self):
+        tk.Label(self.frame_settings, text="Settings", font=("Arial",14)).pack(pady=5)
+        tk.Label(self.frame_settings,text="Device Name:").pack(anchor="w",padx=10,pady=5)
+        self.en_name = tk.Entry(self.frame_settings)
+        self.en_name.insert(0, cfg["device_name"])
+        self.en_name.pack(padx=10)
+        tk.Label(self.frame_settings,text="Receive Folder:").pack(anchor="w",padx=10,pady=5)
+        self.en_folder = tk.Entry(self.frame_settings)
+        self.en_folder.insert(0, cfg["recv_folder"])
+        self.en_folder.pack(padx=10)
+
+        def browse_folder():
+            d = filedialog.askdirectory(initialdir=cfg["recv_folder"])
+            if d:
+                self.en_folder.delete(0,tk.END)
+                self.en_folder.insert(0,d)
+
+        tk.Button(self.frame_settings, text="Browse...", command=browse_folder).pack(pady=5)
+        tk.Button(self.frame_settings, text="Save", command=self.save_settings).pack(pady=10)
+        tk.Button(self.frame_settings, text="← Back", command=lambda: self.show_frame(self.frame_devices)).pack(pady=5)
+
+    def save_settings(self):
+        cfg["device_name"], cfg["recv_folder"] = self.en_name.get(), self.en_folder.get()
+        os.makedirs(cfg["recv_folder"], exist_ok=True)
+        save_config(cfg)
+        messagebox.showinfo("Saved", "Settings updated")
+        self.show_frame(self.frame_devices)
+
+    # Logic for devices list selection
+    def update_devices(self, devs):
+        self.devices = devs
+        self.lb.delete(0,"end")
+        self.lb_map = {}
+        for i, (ip,(nm,_)) in enumerate(devs.items()):
+            self.lb.insert("end", f"{nm} ({ip})")
+            self.lb_map[i] = (ip, nm)
+
+    def on_select(self, evt):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        ip, name = self.lb_map.get(idx, (None, None))
+        if not ip:
+            return
+        self.target_ip = ip
+        self.lbl_target.config(text=name)
+        self.show_frame(self.frame_send)
+
+    def choose_file(self):
+        f = filedialog.askopenfilename()
+        if f:
+            self.filepath = f
+            self.lbl_file.config(text=os.path.basename(f))
+            self.btn_send.config(state="normal")
+
+    def start_send(self):
+        self.btn_send.config(state="disabled")
+        self.btn_pause.config(state="normal")
+        self.btn_cancel.config(state="normal")
+        self.progress["value"] = 0
+        self.sender = FileSender(self.target_ip, self.filepath, self.on_prog, self.on_done)
+        self.sender.start()
+
+    def on_prog(self, s, t):
+        try:
+            self.progress["maximum"], self.progress["value"] = t, s
+        except Exception:
+            print("[GUI] on_prog error:")
+            print(traceback.format_exc())
+
+    def pause_send(self):
+        if not self.sender: return
+        self.btn_pause.config(state="disabled")
+        self.btn_resume.config(state="normal")
+        self.sender.pause.set()
+
+    def resume_send(self):
+        if not self.sender: return
+        self.btn_pause.config(state="normal")
+        self.btn_resume.config(state="disabled")
+        self.sender.pause.clear()
+
+    def cancel_send(self):
+        if not self.sender: return
+        self.sender.stop = True
+        # also unpause so thread can exit if it was paused
+        self.sender.pause.clear()
+        self.btn_cancel.config(state="disabled")
+
+    def on_done(self, ok):
+        try:
+            messagebox.showinfo("Result", "Sent successfully" if ok else "Send failed")
+        except Exception:
+            pass
+        # reset buttons
+        self.btn_pause.config(state="disabled")
+        self.btn_resume.config(state="disabled")
+        self.btn_cancel.config(state="disabled")
+        self.btn_send.config(state="disabled")
+        self.show_frame(self.frame_devices)
+
+# — Startup —
+
+if __name__ == "__main__":
+    init_db()
+    root = tk.Tk()
+    app = LuftGUI(root)
+    root.mainloop()
