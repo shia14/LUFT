@@ -1,0 +1,668 @@
+import os
+import socket
+import threading
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+import sqlite3
+import json
+import time
+import traceback
+import tkinter.font as tkfont
+
+# — Configuration & State —
+
+CONFIG_PATH = "luft_config.json"
+DB_PATH = "luft_history.db"
+
+def load_config():
+    default = {"device_name": "LuftDevice", "recv_folder": os.getcwd()}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            data = json.load(open(CONFIG_PATH))
+            return {**default, **data}
+        except Exception:
+            pass
+    json.dump(default, open(CONFIG_PATH, "w"))
+    return default
+
+def save_config(cfg):
+    json.dump(cfg, open(CONFIG_PATH, "w"))
+
+cfg = load_config()
+os.makedirs(cfg["recv_folder"], exist_ok=True)
+
+# — History DB Setup —
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''
+      CREATE TABLE IF NOT EXISTS history(
+          id INTEGER PRIMARY KEY,
+          timestamp DATETIME,
+          filename TEXT, direction TEXT,
+          peer TEXT, status TEXT
+      )
+    ''')
+    conn.close()
+
+def log_history(filename, direction, peer, status):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''
+      INSERT INTO history(timestamp,filename,direction,peer,status)
+      VALUES (?,?,?,?,?)
+    ''', (time.strftime("%Y-%m-%d %H:%M:%S"), filename, direction, peer, status))
+    conn.commit()
+    conn.close()
+
+# — Device Discovery via UDP —
+
+UDP_PORT = 52000
+BROADCAST_INTERVAL = 2
+EXPIRY = 6
+
+class DeviceScanner(threading.Thread):
+    def __init__(self, on_update):
+        super().__init__(daemon=True)
+        self.on_update = on_update
+        self.devices = {}
+
+    def run(self):
+        threading.Thread(target=self._broadcast, daemon=True).start()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", UDP_PORT))
+        except Exception:
+            print("[DeviceScanner] bind failed:")
+            print(traceback.format_exc())
+            return
+        sock.settimeout(1)
+        while True:
+            now = time.time()
+            try:
+                data, addr = sock.recvfrom(256)
+                msg = data.decode(errors="ignore")
+                if msg.startswith("LUFT::"):
+                    name = msg.split("::",1)[1]
+                    self.devices[addr[0]] = (name, now)
+            except socket.timeout:
+                pass
+            except Exception:
+                print("[DeviceScanner] recv error:")
+                print(traceback.format_exc())
+            # purge expired
+            self.devices = {ip: (n,t) for ip,(n,t) in self.devices.items() if now-t < EXPIRY}
+            try:
+                self.on_update(self.devices)
+            except Exception:
+                print("[DeviceScanner] on_update error:")
+                print(traceback.format_exc())
+
+    def _broadcast(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while True:
+            try:
+                msg = f"LUFT::{cfg['device_name']}"
+                sock.sendto(msg.encode(), ("<broadcast>", UDP_PORT))
+            except Exception:
+                print("[DeviceScanner] broadcast error:")
+                print(traceback.format_exc())
+            time.sleep(BROADCAST_INTERVAL)
+
+# — TCP Receiver —
+
+TCP_PORT = 53000
+BUFFER = 4096
+
+def start_receiver():
+    def handle(c):
+        fn = "[?]"
+        peer = "[?]"
+        try:
+            peer = c.getpeername()[0]
+            fn = c.recv(256).decode()
+            base, ext = os.path.splitext(fn)
+            dest = os.path.join(cfg["recv_folder"], fn)
+            i = 1
+            while os.path.exists(dest):
+                dest = os.path.join(cfg["recv_folder"], f"{base}_{i}{ext}")
+                i += 1
+            with open(dest,"wb") as f:
+                while True:
+                    chunk = c.recv(BUFFER)
+                    if not chunk: break
+                    f.write(chunk)
+            log_history(fn, "received", peer, "success")
+        except Exception:
+            print("[Receiver] error handling incoming file:")
+            print(traceback.format_exc())
+            log_history(fn if fn else "[?]", "received", peer, "fail")
+        finally:
+            try:
+                c.close()
+            except:
+                pass
+
+    def server():
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("", TCP_PORT)); s.listen(5)
+        except Exception:
+            print("[Receiver] bind/listen failed:")
+            print(traceback.format_exc())
+            return
+        while True:
+            try:
+                conn,_ = s.accept()
+                threading.Thread(target=handle, args=(conn,), daemon=True).start()
+            except Exception:
+                print("[Receiver] accept error:")
+                print(traceback.format_exc())
+
+    threading.Thread(target=server, daemon=True).start()
+
+# — Sender w/ Pause/Resume —
+
+class FileSender(threading.Thread):
+    def __init__(self, ip, filepath, on_progress, on_complete):
+        super().__init__(daemon=True)
+        self.ip, self.filepath = ip, filepath
+        self.on_progress, self.on_complete = on_progress, on_complete
+        self.pause = threading.Event()
+        self.stop = False
+
+    def run(self):
+        fn = os.path.basename(self.filepath)
+        try:
+            size = os.path.getsize(self.filepath)
+            sent = 0
+            s = socket.socket()
+            s.settimeout(10)
+            s.connect((self.ip, TCP_PORT))
+            s.send(fn.encode())
+            with open(self.filepath,"rb") as f:
+                while not self.stop:
+                    if self.pause.is_set():
+                        time.sleep(0.2)
+                        continue
+                    data = f.read(BUFFER)
+                    if not data: break
+                    s.sendall(data)
+                    sent += len(data)
+                    try:
+                        self.on_progress(sent, size)
+                    except Exception:
+                        print("[FileSender] on_progress callback error:")
+                        print(traceback.format_exc())
+            try:
+                s.close()
+            except:
+                pass
+            log_history(fn, "sent", self.ip, "success" if not self.stop else "stopped")
+            try:
+                self.on_complete(not self.stop)
+            except Exception:
+                print("[FileSender] on_complete callback error:")
+                print(traceback.format_exc())
+        except Exception:
+            print("[FileSender] send failed:")
+            print(traceback.format_exc())
+            log_history(fn, "sent", self.ip, "fail")
+            try:
+                self.on_complete(False)
+            except Exception:
+                pass
+
+# — Retro Windows 97 Theming (Full-on colorful) —
+
+# Palette inspired by classic Windows 95/97 but dialed up with popping accents
+PALETTE = {
+    "bg": "#C0C0C0",        # classic desktop gray
+    "panel": "#E0E0E0",     # lighter panel background
+    "accent1": "#00B7EB",   # bright cyan (send)
+    "accent2": "#FF55FF",   # magenta (pause)
+    "accent3": "#FFD700",   # mustard yellow (cancel)
+    "accent4": "#32CD32",   # lime green (settings)
+    "list_bg": "#FFF1B5",   # pale yellow list background
+    "title": "#9B30FF",     # purple title bar
+    "text": "#000000",
+}
+
+# helper to darken a hex color
+def darken(hexcol, factor=0.9):
+    hexcol = hexcol.lstrip('#')
+    lv = len(hexcol)
+    rgb = tuple(int(hexcol[i:i+lv//3], 16) for i in range(0, lv, lv//3))
+    drgb = tuple(max(0, int(c*factor)) for c in rgb)
+    return '#%02x%02x%02x' % drgb
+
+# small helper to create retro buttons
+def mk_button(parent, text, cmd, bg, fg="white", width=12):
+    b = tk.Button(parent, text=text, command=cmd,
+                  bg=bg, fg=fg,
+                  activebackground=darken(bg, 0.85),
+                  relief="raised", bd=2, padx=6, pady=3,
+                  font=("MS Sans Serif", 9, "bold"),
+                  width=width)
+    return b
+
+# — Chunky Scrollbar (Win95-style) —
+class ChunkyScrollbar(tk.Frame):
+    """A simple chunky vertical scrollbar that visually matches the retro theme.
+    Attach to widgets with .attach(widget) which configures the widget's yscrollcommand.
+    """
+    def __init__(self, parent, height=200):
+        super().__init__(parent, bg=PALETTE['panel'])
+        self.widget = None
+        self.height = height
+        # Up button
+        self.btn_up = tk.Button(self, text='▲', font=("MS Sans Serif", 8, "bold"), width=2, height=1,
+                                bg=PALETTE['panel'], relief='raised', bd=2)
+        self.btn_up.pack(side='top', pady=0)
+        # track canvas
+        self.canvas = tk.Canvas(self, width=22, height=self.height, bg=PALETTE['panel'], highlightthickness=1, highlightbackground='black')
+        self.canvas.pack(side='top', fill='y', expand=True)
+        # Down button
+        self.btn_down = tk.Button(self, text='▼', font=("MS Sans Serif", 8, "bold"), width=2, height=1,
+                                  bg=PALETTE['panel'], relief='raised', bd=2)
+        self.btn_down.pack(side='top', pady=0)
+
+        # events
+        self.btn_up.config(command=self._on_up)
+        self.btn_down.config(command=self._on_down)
+        self.canvas.bind('<Button-1>', self._on_click_canvas)
+
+        # thumb state
+        self.thumb = None
+        self.first = 0.0
+        self.last = 1.0
+
+    def attach(self, widget):
+        self.widget = widget
+        try:
+            widget.configure(yscrollcommand=self.set)
+        except Exception:
+            pass
+
+    def _on_up(self):
+        if not self.widget: return
+        try:
+            self.widget.yview_scroll(-1, 'units')
+        except Exception:
+            pass
+
+    def _on_down(self):
+        if not self.widget: return
+        try:
+            self.widget.yview_scroll(1, 'units')
+        except Exception:
+            pass
+
+    def _on_click_canvas(self, ev):
+        if not self.widget: return
+        h = int(self.canvas['height'])
+        click_ratio = ev.y / h
+        # move so clicked position is near top of thumb (page scroll)
+        try:
+            self.widget.yview_moveto(click_ratio)
+        except Exception:
+            pass
+
+    def set(self, first, last):
+        # called by the widget to set thumb position
+        try:
+            first_f = float(first)
+            last_f = float(last)
+        except Exception:
+            return
+        self.first = first_f
+        self.last = last_f
+        self._draw_thumb()
+
+    def _draw_thumb(self):
+        self.canvas.delete('all')
+        h = int(self.canvas['height'])
+        w = int(self.canvas['width'])
+        # outline trough
+        self.canvas.create_rectangle(0, 0, w, h, outline='black', fill=PALETTE['panel'])
+        # compute thumb coordinates
+        top = int(self.first * h)
+        bottom = max(top+6, int(self.last * h))
+        # draw chunky thumb in accent color with black outline
+        self.canvas.create_rectangle(2, top, w-2, bottom, outline='black', fill=PALETTE['accent4'])
+
+# — Retro "L" Icon (generated with PhotoImage, no external files) —
+def create_retro_L_icon():
+    img = tk.PhotoImage(width=32, height=32)
+    # helpers
+    def fill(x1,y1,x2,y2,color):
+        img.put(color, to=(x1,y1,x2,y2))
+    # base panel
+    fill(0,0,32,32, PALETTE['panel'])
+    # outer black border
+    fill(0,0,32,1,'black'); fill(0,31,32,32,'black'); fill(0,0,1,32,'black'); fill(31,0,32,32,'black')
+    # title stripe
+    fill(1,1,31,9, PALETTE['title'])
+    # title stripe border
+    fill(1,1,31,2,'black'); fill(1,8,31,9,'black')
+    # cyan badge area
+    fill(6,12,27,27, PALETTE['accent1'])
+    fill(6,12,27,13,'black'); fill(6,26,27,27,'black'); fill(6,12,7,27,'black'); fill(26,12,27,27,'black')
+    # blocky L in black
+    fill(10,14,12,25,'black')  # vertical
+    fill(10,23,22,25,'black')  # horizontal
+    # mustard highlight on top/left edges of L
+    fill(9,14,10,25, PALETTE['accent3'])
+    fill(10,22,22,23, PALETTE['accent3'])
+    return img
+
+# — Main GUI —
+
+class LuftGUI:
+    def __init__(self, root):
+        self.root = root
+        root.title("Luft — Retro 97")
+        # Square window as requested
+        root.geometry("600x600")
+        root.configure(bg=PALETTE['bg'])
+        try:
+            root.iconphoto(True, create_retro_L_icon())
+        except Exception:
+            pass
+
+        # Fonts
+        self.title_font = ("MS Sans Serif", 14, "bold")
+        self.heading_font = ("MS Sans Serif", 11, "bold")
+        self.mono_font = ("Courier New", 10)
+        self.button_font = ("MS Sans Serif", 9, "bold")
+
+        # Keep state
+        self.devices = {}
+        self.sender = None
+
+        # Create frames with retro borders
+        self.frame_devices = tk.Frame(root, bg=PALETTE['panel'], bd=2, relief='groove')
+        self.frame_send = tk.Frame(root, bg=PALETTE['panel'], bd=2, relief='groove')
+        self.frame_history = tk.Frame(root, bg=PALETTE['panel'], bd=2, relief='groove')
+        self.frame_settings = tk.Frame(root, bg=PALETTE['panel'], bd=2, relief='groove')
+
+        self.init_device_frame()
+        self.init_send_frame()
+        self.init_history_frame()
+        self.init_settings_frame()
+
+        # Start network threads
+        DeviceScanner(self.update_devices).start()
+        start_receiver()
+
+        self.show_frame(self.frame_devices)
+
+    def show_frame(self, frame):
+        for f in [self.frame_devices, self.frame_send, self.frame_history, self.frame_settings]:
+            f.pack_forget()
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+    # Devices frame
+    def init_device_frame(self):
+        # Title bar (retro colored)
+        title = tk.Label(self.frame_devices, text="Nearby Devices", bg=PALETTE['title'], fg='white', font=self.title_font,
+                         relief='raised', bd=2, padx=6, pady=6)
+        title.pack(fill='x')
+
+        # Listbox styled like retro explorer
+        # use a container so we can attach a chunky scrollbar
+        lb_container = tk.Frame(self.frame_devices, bg=PALETTE['panel'])
+        lb_container.pack(padx=10, pady=10, fill="both", expand=True)
+
+        self.lb = tk.Listbox(lb_container, font=self.mono_font,
+                             bg=PALETTE['list_bg'], fg=PALETTE['text'], bd=2, relief='sunken', selectbackground=PALETTE['accent2'],
+                             selectforeground='white', activestyle='dotbox')
+        self.lb.pack(side='left', fill="both", expand=True)
+        self.lb.bind("<<ListboxSelect>>", self.on_select)
+        self.lb_map = {}
+
+        # chunky scrollbar for listbox
+        self.lb_scroll = ChunkyScrollbar(lb_container, height=300)
+        self.lb_scroll.pack(side='right', fill='y')
+        self.lb_scroll.attach(self.lb)
+
+        # Footer buttons
+        fb = tk.Frame(self.frame_devices, bg=PALETTE['panel'])
+        fb.pack(fill='x', pady=6)
+        btn_history = mk_button(fb, "History", lambda: [self.update_history(), self.show_frame(self.frame_history)], PALETTE['accent4'])
+        btn_history.pack(side='left', padx=6)
+        btn_settings = mk_button(fb, "Settings", lambda: self.show_frame(self.frame_settings), PALETTE['accent1'])
+        btn_settings.pack(side='right', padx=6)
+
+    # Send frame
+    def init_send_frame(self):
+        h = tk.Label(self.frame_send, text="Send File", font=self.heading_font, bg=PALETTE['panel'])
+        h.pack(pady=6)
+        tk.Label(self.frame_send, text="Target:", bg=PALETTE['panel'], font=self.heading_font).pack(pady=2)
+        self.lbl_target = tk.Label(self.frame_send, text="(none)", font=self.heading_font, bg=PALETTE['panel'])
+        self.lbl_target.pack()
+
+        choose = mk_button(self.frame_send, "Choose File", self.choose_file, PALETTE['accent3'], fg='black')
+        choose.pack(pady=6)
+        self.lbl_file = tk.Label(self.frame_send, text="No file selected", bg=PALETTE['panel'], font=self.mono_font)
+        self.lbl_file.pack()
+
+        # Retro chunky progress bar using Canvas
+        self.progress_canvas = tk.Canvas(self.frame_send, width=360, height=20, bg=PALETTE['panel'], highlightthickness=1, highlightbackground='black')
+        self.progress_canvas.pack(pady=12)
+
+        self.progress_total = 1
+        self.progress_value = 0
+        self.update_progress_canvas()
+
+        fcb = tk.Frame(self.frame_send, bg=PALETTE['panel'])
+        fcb.pack()
+        self.btn_send = mk_button(fcb, "Send", self.start_send, PALETTE['accent1'])
+        self.btn_send.grid(row=0, column=0, padx=6)
+        self.btn_pause = mk_button(fcb, "Pause", self.pause_send, PALETTE['accent2'])
+        self.btn_pause.grid(row=0, column=1, padx=6)
+        self.btn_resume = mk_button(fcb, "Resume", self.resume_send, PALETTE['accent1'])
+        self.btn_resume.grid(row=0, column=2, padx=6)
+        self.btn_cancel = mk_button(fcb, "Cancel", self.cancel_send, PALETTE['accent3'], fg='black')
+        self.btn_cancel.grid(row=0, column=3, padx=6)
+
+        back = mk_button(self.frame_send, "← Back", lambda: self.show_frame(self.frame_devices), PALETTE['title'])
+        back.pack(pady=10)
+
+        # default states
+        self.btn_send.config(state='disabled')
+        self.btn_pause.config(state='disabled')
+        self.btn_resume.config(state='disabled')
+        self.btn_cancel.config(state='disabled')
+
+    # History frame
+    def init_history_frame(self):
+        title = tk.Label(self.frame_history, text="Transfer History", bg=PALETTE['title'], fg='white', font=self.title_font,
+                         relief='raised', bd=2, padx=6, pady=6)
+        title.pack(fill='x')
+
+        # container for treeview + chunky scrollbar
+        tv_container = tk.Frame(self.frame_history, bg=PALETTE['panel'])
+        tv_container.pack(fill="both",expand=True, padx=10, pady=10)
+
+        self.tv = ttk.Treeview(tv_container, columns=("timestamp","filename","direction","peer","status"), show="headings")
+        cols=[("timestamp","Time"),("filename","File"),("direction","Dir"),("peer","Peer"),("status","Status")]
+        for c,t in cols:
+            self.tv.heading(c, text=t)
+        self.tv.column("timestamp", width=140)
+        self.tv.column("filename", width=220)
+        self.tv.column("direction", width=60)
+        self.tv.column("peer", width=120)
+        self.tv.column("status", width=80)
+        self.tv.pack(side='left', fill='both', expand=True)
+
+        self.tv_scroll = ChunkyScrollbar(tv_container, height=320)
+        self.tv_scroll.pack(side='right', fill='y')
+        self.tv_scroll.attach(self.tv)
+
+        back = mk_button(self.frame_history, "← Back", lambda: self.show_frame(self.frame_devices), PALETTE['title'])
+        back.pack(pady=8)
+
+    def update_history(self):
+        self.tv.delete(*self.tv.get_children())
+        conn = sqlite3.connect(DB_PATH)
+        for row in conn.execute("SELECT timestamp,filename,direction,peer,status FROM history ORDER BY id DESC"):
+            self.tv.insert("","end",values=row)
+        conn.close()
+
+    # Settings frame (labels aligned with entries)
+    def init_settings_frame(self):
+        title = tk.Label(self.frame_settings, text="Settings", bg=PALETTE['title'], fg='white', font=self.title_font,
+                         relief='raised', bd=2, padx=6, pady=6)
+        title.pack(fill='x')
+
+        form = tk.Frame(self.frame_settings, bg=PALETTE['panel'])
+        form.pack(fill='x', padx=10, pady=10)
+
+        # Labels (right-aligned) and Entries (left), neatly aligned
+        lbl_name = tk.Label(form, text="Device Name:", bg=PALETTE['panel'], anchor='e', width=14)
+        lbl_name.grid(row=0, column=0, sticky='e', padx=(0,6), pady=5)
+        self.en_name = tk.Entry(form, bd=2, relief='sunken', font=self.mono_font, width=40)
+        self.en_name.insert(0, cfg["device_name"])
+        self.en_name.grid(row=0, column=1, sticky='w')
+
+        lbl_folder = tk.Label(form, text="Receive Folder:", bg=PALETTE['panel'], anchor='e', width=14)
+        lbl_folder.grid(row=1, column=0, sticky='e', padx=(0,6), pady=5)
+        self.en_folder = tk.Entry(form, bd=2, relief='sunken', font=self.mono_font, width=40)
+        self.en_folder.insert(0, cfg["recv_folder"])
+        self.en_folder.grid(row=1, column=1, sticky='w')
+
+        def browse_folder():
+            d = filedialog.askdirectory(initialdir=cfg["recv_folder"])
+            if d:
+                self.en_folder.delete(0,tk.END)
+                self.en_folder.insert(0,d)
+
+        btns = tk.Frame(self.frame_settings, bg=PALETTE['panel'])
+        btns.pack(fill='x')
+        btn_browse = mk_button(btns, "Browse...", browse_folder, PALETTE['accent4'])
+        btn_browse.pack(pady=6, side='left', padx=10)
+        btn_save = mk_button(btns, "Save", self.save_settings, PALETTE['accent1'])
+        btn_save.pack(pady=4, side='left')
+        back = mk_button(self.frame_settings, "← Back", lambda: self.show_frame(self.frame_devices), PALETTE['title'])
+        back.pack(pady=6)
+
+    def save_settings(self):
+        cfg["device_name"], cfg["recv_folder"] = self.en_name.get(), self.en_folder.get()
+        os.makedirs(cfg["recv_folder"], exist_ok=True)
+        save_config(cfg)
+        messagebox.showinfo("Saved", "Settings updated")
+        self.show_frame(self.frame_devices)
+
+    # Logic for devices list selection (ensure UI updates happen on main thread)
+    def update_devices(self, devs):
+        # schedule on main thread
+        try:
+            self.root.after(0, lambda: self._apply_device_update(devs))
+        except Exception:
+            # fallback
+            self._apply_device_update(devs)
+
+    def _apply_device_update(self, devs):
+        self.devices = devs
+        self.lb.delete(0,"end")
+        self.lb_map = {}
+        for i, (ip,(nm,_)) in enumerate(devs.items()):
+            self.lb.insert("end", f"{nm} ({ip})")
+            self.lb_map[i] = (ip, nm)
+
+    def on_select(self, evt):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        ip, name = self.lb_map.get(idx, (None, None))
+        if not ip:
+            return
+        self.target_ip = ip
+        self.lbl_target.config(text=name)
+        self.show_frame(self.frame_send)
+
+    def choose_file(self):
+        f = filedialog.askopenfilename()
+        if f:
+            self.filepath = f
+            self.lbl_file.config(text=os.path.basename(f))
+            self.btn_send.config(state="normal")
+
+    def start_send(self):
+        self.btn_send.config(state="disabled")
+        self.btn_pause.config(state="normal")
+        self.btn_cancel.config(state="normal")
+        # reset progress
+        self.progress_value = 0
+        self.progress_total = 1
+        self.update_progress_canvas()
+        self.sender = FileSender(self.target_ip, self.filepath, self.on_prog, self.on_done)
+        self.sender.start()
+
+    def on_prog(self, s, t):
+        # invoked from sender thread — schedule UI update on main thread
+        self.progress_total = max(1, t)
+        self.progress_value = s
+        try:
+            self.root.after(0, self.update_progress_canvas)
+        except Exception:
+            pass
+
+    def update_progress_canvas(self):
+        self.progress_canvas.delete("all")
+        w = int(self.progress_canvas['width'])
+        h = int(self.progress_canvas['height'])
+        filled = int((self.progress_value / max(1, self.progress_total)) * w)
+        # Draw filled chunks
+        chunk_width = 10
+        for x in range(0, filled, chunk_width):
+            self.progress_canvas.create_rectangle(x, 0, min(x+chunk_width-2, w), h, fill=PALETTE['accent1'], outline='black')
+        # Outline
+        self.progress_canvas.create_rectangle(0, 0, w, h, outline='black')
+
+    def pause_send(self):
+        if not self.sender: return
+        self.btn_pause.config(state="disabled")
+        self.btn_resume.config(state="normal")
+        self.sender.pause.set()
+
+    def resume_send(self):
+        if not self.sender: return
+        self.btn_pause.config(state="normal")
+        self.btn_resume.config(state="disabled")
+        self.sender.pause.clear()
+
+    def cancel_send(self):
+        if not self.sender: return
+        self.sender.stop = True
+        self.sender.pause.clear()
+        self.btn_cancel.config(state="disabled")
+
+    def on_done(self, ok):
+        # must run in main thread
+        def finish():
+            try:
+                messagebox.showinfo("Result", "Sent successfully" if ok else "Send failed")
+            except Exception:
+                pass
+            self.btn_pause.config(state="disabled")
+            self.btn_resume.config(state="disabled")
+            self.btn_cancel.config(state="disabled")
+            self.btn_send.config(state="disabled")
+            self.show_frame(self.frame_devices)
+        try:
+            self.root.after(0, finish)
+        except Exception:
+            finish()
+
+# — Startup —
+
+if __name__ == "__main__":
+    init_db()
+    root = tk.Tk()
+    app = LuftGUI(root)
+    root.mainloop()
